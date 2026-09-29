@@ -1,0 +1,7 @@
+interface:
+  display_name: "Outline memory"
+  short_description: "Save this conversation as an Outline memory page"
+  default_prompt: "Use $outlinememory to save a memory of this conversation to Outline."
+
+policy:
+  allow_implicit_invocation: true

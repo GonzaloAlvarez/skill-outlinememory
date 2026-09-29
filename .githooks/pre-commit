@@ -1,0 +1,3 @@
+#!/bin/bash
+# Refuse commits that add secret-looking or instance-identifying strings.
+exec "$(git rev-parse --show-toplevel)/scripts/no-secrets-check" --staged

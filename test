@@ -1,0 +1,17 @@
+#!/bin/bash
+# ./test — unit tests (offline fake Outline + real curl), secret scan, and the Codex skill validator when present.
+set -euo pipefail
+cd "$(dirname "$0")"
+python3 -m unittest discover -s tests -v
+scripts/no-secrets-check
+V="${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-creator/scripts/quick_validate.py"
+if [ -f "$V" ] && python3 -c 'import yaml' 2>/dev/null; then
+  echo "codex validator: $(python3 "$V" skills/outlinememory)"
+else
+  echo "codex validator: not available on this machine (skipped)"
+fi
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck install.sh test .githooks/pre-commit || { echo "shellcheck: FAILED"; exit 1; }
+  echo "shellcheck: clean"
+fi
+echo "all checks passed"

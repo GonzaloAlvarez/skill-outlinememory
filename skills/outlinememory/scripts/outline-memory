@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""outline-memory — save a conversation memory as a page in an Outline collection.
+
+Layout created in the target collection (all names configurable):
+
+    <collection>            e.g. Memories
+    └── <root>              e.g. dev            (empty container page)
+        └── <project>       e.g. my-repo        (empty container page)
+            └── YYYY-MM-DD <topic>              (the memory page)
+
+Transport is `curl` (SOCKS5h proxies and private CAs work everywhere); everything
+else is the Python 3 standard library. Configuration lives in ~/.outline-memory.yml
+and the API token in ~/.outline-token (see README.md). Exit codes:
+
+    0 ok · 2 usage · 3 config/token · 4 transport · 5 auth/permission
+    6 collection not found · 7 ambiguous parent / strict-title collision
+    8 secret-like content in body · 9 other Outline API error
+"""
+
+import argparse
+import datetime as _dt
+import json
+import os
+import re
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+
+VERSION = "0.1.0"
+
+EXIT_OK, EXIT_USAGE, EXIT_CONFIG, EXIT_TRANSPORT, EXIT_AUTH = 0, 2, 3, 4, 5
+EXIT_COLLECTION, EXIT_AMBIGUOUS, EXIT_SECRET, EXIT_API = 6, 7, 8, 9
+
+DEFAULT_CONFIG = "~/.outline-memory.yml"
+DEFAULTS = {
+    "token_file": "~/.outline-token",
+    "collection": "Memories",
+    "root": "dev",
+    "proxy": "auto",
+    "proxy_probe": "127.0.0.1:1055",
+    "timeout": "30",
+}
+KNOWN_KEYS = {"url", "token", "token_file", "collection", "root", "proxy", "proxy_probe",
+              "ca_file", "timeout", "projects"}
+MAX_TITLE = 100
+BODY_WARN_BYTES = 200 * 1024
+
+# Patterns that must never end up in a memory page (name → regex). Matched text is never printed.
+SECRET_PATTERNS = [
+    ("outline api key", re.compile(r"ol_api_[A-Za-z0-9]{16,}")),
+    ("openai/anthropic key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}")),
+    ("github token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
+    ("aws access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("private key block", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("bearer token", re.compile(r"Bearer [A-Za-z0-9._~+/=-]{24,}")),
+    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{8,}")),
+    ("slack token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
+    ("credential assignment",
+     re.compile(r"(?i)[A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|private[_-]?key)"
+                r"\s*[:=]\s*['\"]?[A-Za-z0-9_\-/+=]{16,}")),
+]
+
+
+class OMError(Exception):
+    """A failure with an exit code and an optional one-line hint."""
+
+    def __init__(self, code, message, hint=None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.hint = hint
+
+
+def warn(msg):
+    sys.stderr.write("warning: %s\n" % msg)
+
+
+# ── config ────────────────────────────────────────────────────────────────────
+
+def config_path(explicit):
+    return os.path.expanduser(explicit or os.environ.get("OUTLINE_MEMORY_CONFIG") or DEFAULT_CONFIG)
+
+
+def _parse_value(value):
+    """Strip quotes and trailing `# comments` from a scalar value."""
+    value = value.strip()
+    if not value or value.startswith("#"):
+        return ""
+    if value[0] in "\"'":
+        end = value.find(value[0], 1)
+        return value[1:end] if end != -1 else value[1:]
+    return value.split(" #", 1)[0].rstrip() if " #" in value else value
+
+
+def parse_config_text(text, source="<config>"):
+    """Flat `key: value` lines plus one optional indented `projects:` block."""
+    cfg = {}
+    projects = {}
+    in_projects = False
+    top = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$")
+    nested = re.compile(r"^\s+([^:#][^:]*?):\s*(.+)$")
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.rstrip()
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if in_projects and line[0] in " \t":
+            m = nested.match(line)
+            if not m:
+                raise OMError(EXIT_CONFIG, "%s:%d: cannot parse projects entry: %r" % (source, lineno, stripped),
+                              hint="use `  derived-name: Display name` (two-space indent)")
+            projects[m.group(1).strip()] = _parse_value(m.group(2))
+            continue
+        in_projects = False
+        m = top.match(line)
+        if not m:
+            raise OMError(EXIT_CONFIG, "%s:%d: cannot parse line: %r" % (source, lineno, stripped),
+                          hint="only flat `key: value` lines and a `projects:` block are supported")
+        key, value = m.group(1), m.group(2)
+        if key == "projects":
+            in_projects = True
+            continue
+        if key not in KNOWN_KEYS:
+            warn("%s:%d: unknown key %r ignored" % (source, lineno, key))
+            continue
+        cfg[key] = _parse_value(value)
+    cfg["projects"] = projects
+    return cfg
+
+
+def load_config(path):
+    if not os.path.exists(path):
+        raise OMError(EXIT_CONFIG, "config missing: %s" % path,
+                      hint="cp config.example.yml %s and set `url:` (see README.md)" % path)
+    with open(path, "r", encoding="utf-8") as fh:
+        cfg = parse_config_text(fh.read(), path)
+    for key, value in DEFAULTS.items():
+        cfg.setdefault(key, value)
+    url = cfg.get("url", "").strip().rstrip("/")
+    if not re.match(r"^https?://[^\s/]+", url):
+        raise OMError(EXIT_CONFIG, "config %s: `url:` missing or not http(s)://host" % path,
+                      hint="url: https://outline.example.com  (no /api suffix)")
+    if url.endswith("/api"):
+        url = url[:-4]
+    cfg["url"] = url
+    try:
+        cfg["timeout"] = int(str(cfg["timeout"]).strip())
+    except ValueError:
+        raise OMError(EXIT_CONFIG, "config %s: `timeout:` must be an integer" % path)
+    for key in ("token_file", "ca_file"):
+        if cfg.get(key):
+            cfg[key] = os.path.expanduser(cfg[key])
+    if cfg.get("ca_file") and not os.path.exists(cfg["ca_file"]):
+        raise OMError(EXIT_CONFIG, "config %s: ca_file not found: %s" % (path, cfg["ca_file"]))
+    cfg["_path"] = path
+    return cfg
+
+
+def load_token(cfg):
+    """Returns (token, description). Inline `token:` wins over `token_file:`."""
+    inline = (cfg.get("token") or "").strip()
+    if inline:
+        warn("using inline `token:` from the config file; prefer token_file")
+        return inline, "inline in %s" % cfg["_path"]
+    path = cfg["token_file"]
+    if not os.path.exists(path):
+        raise OMError(EXIT_CONFIG, "token file missing: %s" % path,
+                      hint="save your Outline API key there: (umask 077; printf '%%s\\n' ol_api_... > %s)" % path)
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    if mode & 0o077:
+        warn("%s is mode %o; expected 0600 (chmod 600 %s)" % (path, mode, path))
+    with open(path, "r", encoding="utf-8") as fh:
+        token = fh.read().strip()
+    if not token:
+        raise OMError(EXIT_CONFIG, "token file is empty: %s" % path)
+    if not token.startswith("ol_api_"):
+        warn("token in %s does not start with ol_api_ — is it an Outline API key?" % path)
+    return token, "%s (mode %o, %d chars)" % (path, mode, len(token))
+
+
+# ── transport (curl) ──────────────────────────────────────────────────────────
+
+def probe_tcp(hostport, timeout=0.4):
+    host, _, port = hostport.rpartition(":")
+    try:
+        with socket.create_connection((host or "127.0.0.1", int(port)), timeout=timeout):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+class Transport:
+    def __init__(self, cfg, token):
+        self.url = cfg["url"]
+        self.timeout = cfg["timeout"]
+        self.ca_file = cfg.get("ca_file")
+        self.token = token
+        self.proxy, self.proxy_reason = self._decide(cfg)
+        self.curl = shutil.which("curl")
+        if not self.curl:
+            raise OMError(EXIT_TRANSPORT, "curl not found in PATH", hint="install curl")
+        self._tmp = None
+
+    @staticmethod
+    def _decide(cfg):
+        mode = (cfg.get("proxy") or "auto").strip()
+        if mode == "none":
+            return None, "direct (proxy: none)"
+        if mode == "auto":
+            probe = cfg.get("proxy_probe") or DEFAULTS["proxy_probe"]
+            if probe_tcp(probe):
+                return "socks5h://" + probe, "auto → socks5h://%s (proxy port open)" % probe
+            return None, "auto → direct (no proxy listening on %s)" % probe
+        return mode, "configured: %s" % mode
+
+    def describe(self):
+        return self.proxy or "direct"
+
+    def _tmpdir(self):
+        if self._tmp is None:
+            self._tmp = tempfile.mkdtemp(prefix="outline-memory.")
+        return self._tmp
+
+    def close(self):
+        if self._tmp and os.path.isdir(self._tmp):
+            shutil.rmtree(self._tmp, ignore_errors=True)
+        self._tmp = None
+
+    def _headers_file(self):
+        path = os.path.join(self._tmpdir(), "headers")
+        if not os.path.exists(path):
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write("Authorization: Bearer %s\nContent-Type: application/json\nAccept: application/json\n"
+                         % self.token)
+        return path
+
+    def _run(self, args, stdin=None):
+        body_path = os.path.join(self._tmpdir(), "body")
+        cmd = [self.curl, "-sS", "-o", body_path, "-w", "%{http_code}", "--max-time", str(self.timeout)]
+        if self.proxy:
+            cmd += ["--proxy", self.proxy]
+        if self.ca_file:
+            cmd += ["--cacert", self.ca_file]
+        cmd += args
+        try:
+            proc = subprocess.run(cmd, input=stdin, capture_output=True, timeout=self.timeout + 10)
+        except subprocess.TimeoutExpired:
+            raise OMError(EXIT_TRANSPORT, "curl timed out after %ss" % self.timeout)
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+            msg = err[-1] if err else "curl exit %d" % proc.returncode
+            hint = None
+            if self.proxy and "proxy" in msg.lower() or "SOCKS" in msg:
+                hint = "the SOCKS proxy is not usable; start it or set `proxy: none`"
+            elif "resolve" in msg.lower():
+                hint = "DNS could not resolve the host; on a non-tailnet machine start the SOCKS proxy"
+            elif "certificate" in msg.lower() or "SSL" in msg:
+                hint = "TLS verification failed; set `ca_file:` to your private CA bundle"
+            raise OMError(EXIT_TRANSPORT, "curl: %s" % msg, hint)
+        status = proc.stdout.decode("ascii", "replace").strip()[-3:]
+        with open(body_path, "rb") as fh:
+            body = fh.read().decode("utf-8", "replace")
+        return int(status or 0), body
+
+    def health(self):
+        return self._run(["-X", "GET", self.url + "/_health"])
+
+    def post(self, method, payload):
+        data = json.dumps(payload).encode("utf-8")
+        return self._run(["-X", "POST", "-H", "@" + self._headers_file(), "--data-binary", "@-",
+                          "%s/api/%s" % (self.url, method)], stdin=data)
+
+
+# ── Outline API ───────────────────────────────────────────────────────────────
+
+class Outline:
+    def __init__(self, transport):
+        self.t = transport
+
+    def call(self, method, payload=None):
+        status, body = self.t.post(method, payload or {})
+        try:
+            data = json.loads(body) if body.strip() else {}
+        except ValueError:
+            data = None
+        if data is None or not isinstance(data, dict):
+            head = body.lstrip()[:15].lower()
+            if status == 404 and ("<html" in head or "<!doctype" in head):
+                raise OMError(EXIT_TRANSPORT, "%s: HTTP 404 with an HTML body — this is not your Outline" % method,
+                              hint="DNS resolved to a public/wrong host; start the SOCKS proxy or fix `url:`")
+            raise OMError(EXIT_TRANSPORT, "%s: HTTP %d with a non-JSON body" % (method, status),
+                          hint="check `url:` and the transport (outline-memory check)")
+        if status in (401, 403):
+            raise OMError(EXIT_AUTH, "%s: HTTP %d %s" % (method, status, data.get("message") or data.get("error", "")),
+                          hint="the token is invalid, expired, lacks the `%s` scope, or the user cannot see the target" % method)
+        if status != 200 or not data.get("ok", False):
+            raise OMError(EXIT_API, "%s: HTTP %d %s" % (method, status, data.get("message") or data.get("error", "")))
+        return data.get("data")
+
+    def auth_info(self):
+        return self.call("auth.info")
+
+    def collections_list(self):
+        return self.call("collections.list", {"limit": 100}) or []
+
+    def collection_documents(self, collection_id):
+        return self.call("collections.documents", {"id": collection_id}) or []
+
+    def document_create(self, collection_id, title, text, parent_id=None):
+        payload = {"collectionId": collection_id, "title": title, "text": text, "publish": True}
+        if parent_id:
+            payload["parentDocumentId"] = parent_id
+        return self.call("documents.create", payload)
+
+    def document_info(self, doc_id):
+        return self.call("documents.info", {"id": doc_id})
+
+
+def find_collection(collections, name):
+    exact = [c for c in collections if (c.get("name") or "").strip() == name]
+    if exact:
+        return exact[0]
+    loose = [c for c in collections if (c.get("name") or "").strip().lower() == name.lower()]
+    if loose:
+        warn("collection %r matched case-insensitively as %r" % (name, loose[0].get("name")))
+        return loose[0]
+    visible = ", ".join(sorted((c.get("name") or "?") for c in collections)) or "none"
+    raise OMError(EXIT_COLLECTION, "collection %r not found (visible: %s)" % (name, visible),
+                  hint="check `collection:` in the config and that the token's user can see it")
+
+
+def nodes_titled(nodes, title):
+    return [n for n in nodes if (n.get("title") or "").strip() == title]
+
+
+def count_nodes(nodes):
+    return sum(1 + count_nodes(n.get("children") or []) for n in nodes)
+
+
+def find_node(nodes, node_id):
+    for n in nodes:
+        if n.get("id") == node_id:
+            return n
+        hit = find_node(n.get("children") or [], node_id)
+        if hit:
+            return hit
+    return None
+
+
+# ── project, title, body, rendering ───────────────────────────────────────────
+
+def _git(cwd, *args):
+    try:
+        out = subprocess.run(["git", "-C", cwd] + list(args), capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.decode("utf-8", "replace").strip() or None
+
+
+def repo_basename(remote_url):
+    tail = remote_url.rstrip("/")
+    tail = tail.rsplit("/", 1)[-1]
+    tail = tail.rsplit(":", 1)[-1]
+    if tail.endswith(".git"):
+        tail = tail[:-4]
+    return tail
+
+
+def derive_project(cwd, mapping, explicit=None):
+    """Returns (name, source)."""
+    if explicit:
+        name, source = explicit.strip(), "--project"
+    else:
+        remote = _git(cwd, "remote", "get-url", "origin")
+        top = _git(cwd, "rev-parse", "--show-toplevel")
+        if remote and repo_basename(remote):
+            name, source = repo_basename(remote), "git remote origin"
+        elif top:
+            name, source = os.path.basename(top.rstrip("/")), "git toplevel"
+        else:
+            name, source = os.path.basename(os.path.abspath(cwd).rstrip("/")) or "root", "cwd basename"
+    mapped = (mapping or {}).get(name)
+    if mapped and mapped != name:
+        return mapped, source + " → projects map"
+    return name, source
+
+
+def build_title(topic, today, no_date_prefix=False):
+    topic = " ".join((topic or "").split())
+    if not topic:
+        raise OMError(EXIT_USAGE, "--title must not be empty")
+    if no_date_prefix or re.match(r"^\d{4}-\d{2}-\d{2}\b", topic):
+        title = topic
+    else:
+        title = "%s %s" % (today, topic)
+    if len(title) > MAX_TITLE:
+        warn("title truncated to %d characters" % MAX_TITLE)
+        title = title[:MAX_TITLE - 1].rstrip() + "…"
+    return title
+
+
+def unique_title(title, sibling_titles, strict):
+    if title not in sibling_titles:
+        return title
+    if strict:
+        raise OMError(EXIT_AMBIGUOUS, "a page titled %r already exists under this parent (--strict-title)" % title,
+                      hint="pick another --title or drop --strict-title to get a numbered suffix")
+    n = 2
+    while "%s (%d)" % (title, n) in sibling_titles:
+        n += 1
+    warn("title %r exists; using %r" % (title, "%s (%d)" % (title, n)))
+    return "%s (%d)" % (title, n)
+
+
+def secret_scan(body):
+    hits = []
+    for lineno, line in enumerate(body.splitlines(), 1):
+        for name, rx in SECRET_PATTERNS:
+            if rx.search(line):
+                hits.append("line %d: %s" % (lineno, name))
+    return hits
+
+
+def read_body(spec):
+    if spec == "-":
+        text = sys.stdin.read()
+    else:
+        path = os.path.expanduser(spec)
+        if not os.path.exists(path):
+            raise OMError(EXIT_USAGE, "--body file not found: %s" % path)
+        with open(path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    if not text.strip():
+        raise OMError(EXIT_USAGE, "the memory body is empty")
+    if len(text.encode("utf-8")) > BODY_WARN_BYTES:
+        warn("body is larger than %d KB; consider trimming" % (BODY_WARN_BYTES // 1024))
+    return text.strip("\n") + "\n"
+
+
+def detect_tool():
+    if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE"):
+        return "Claude Code"
+    if any(k.startswith("CODEX_") for k in os.environ):
+        return "Codex CLI"
+    return "unknown"
+
+
+def hostname():
+    name = socket.gethostname().lower()
+    return name[:-6] if name.endswith(".local") else name
+
+
+def render_document(body, project, tool, model, scope, session, cwd, now):
+    top = _git(cwd, "rev-parse", "--show-toplevel") or os.path.abspath(cwd)
+    branch = _git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
+    sha = _git(cwd, "rev-parse", "--short", "HEAD")
+    tool_cell = tool + (" · " + model if model else "")
+    rows = [
+        ("Date", now.strftime("%Y-%m-%d %H:%M %z")),
+        ("Tool", tool_cell),
+        ("Host", hostname()),
+        ("Project", project),
+        ("Repo path", top),
+        ("Branch", ("%s @ %s" % (branch, sha)) if branch and sha else "-"),
+        ("Scope", scope or "whole session"),
+        ("Session", session or "-"),
+        ("Written by", "outlinememory %s" % VERSION),
+    ]
+    banner = "> Memory · %s · %s · project %s" % (tool, now.strftime("%Y-%m-%d"), project)
+    table = "\n".join("| %s | %s |" % (k, v.replace("|", "\\|")) for k, v in rows)
+    return "%s\n\n%s\n## Provenance\n\n| Field | Value |\n|---|---|\n%s\n" % (banner, body, table)
+
+
+# ── shared resolution ─────────────────────────────────────────────────────────
+
+class Context:
+    """Config + token + transport + API, built lazily so `check` can report each step."""
+
+    def __init__(self, args):
+        self.args = args
+        self.cfg = load_config(config_path(args.config))
+        self.token, self.token_desc = load_token(self.cfg)
+        self.transport = Transport(self.cfg, self.token)
+        self.api = Outline(self.transport)
+
+    def close(self):
+        self.transport.close()
+
+    def collection(self):
+        return find_collection(self.api.collections_list(), self.cfg["collection"])
+
+    def resolve_parent(self, tree, project, parent_id=None):
+        return resolve_parent(self.cfg, tree, project, parent_id)
+
+
+def resolve_parent(cfg, tree, project, parent_id=None):
+    """Locate (never create) the root and project containers in a collection tree.
+
+    Returns dict(root=node|None, root_name=str, project=node|None, siblings=[titles], plan=[str]).
+    """
+    plan = []
+    if parent_id:
+        node = find_node(tree, parent_id)
+        if not node:
+            raise OMError(EXIT_AMBIGUOUS, "--parent-id %s is not in the collection tree" % parent_id)
+        plan.append("parent: %s (%s) via --parent-id" % (node.get("title"), parent_id[:8]))
+        return {"root": None, "root_name": "", "project": node,
+                "siblings": [(c.get("title") or "").strip() for c in node.get("children") or []], "plan": plan}
+    root_name = (cfg.get("root") or "").strip()
+    level = tree
+    root = None
+    if root_name:
+        hits = nodes_titled(tree, root_name)
+        if len(hits) > 1:
+            raise OMError(EXIT_AMBIGUOUS, "%d top-level pages are titled %r" % (len(hits), root_name),
+                          hint="rename one in Outline or pass --parent-id")
+        root = hits[0] if hits else None
+        plan.append("root: %s" % ("%s exists (%s)" % (root_name, root["id"][:8]) if root
+                                  else "%s will be created" % root_name))
+        level = (root.get("children") or []) if root else []
+    hits = nodes_titled(level, project)
+    if len(hits) > 1:
+        raise OMError(EXIT_AMBIGUOUS, "%d pages are titled %r under %s" % (len(hits), project, root_name or "the collection"),
+                      hint="rename one in Outline or pass --parent-id")
+    proj = hits[0] if hits else None
+    plan.append("project: %s" % ("%s exists (%s, %d pages)" % (project, proj["id"][:8], len(proj.get("children") or []))
+                                 if proj else "%s will be created" % project))
+    return {"root": root, "root_name": root_name, "project": proj,
+            "siblings": [(c.get("title") or "").strip() for c in (proj.get("children") or [])] if proj else [],
+            "plan": plan}
+
+
+# ── commands ──────────────────────────────────────────────────────────────────
+
+def cmd_check(args):
+    rows = []
+    hard = 0
+    hint_lines = []
+
+    def row(label, detail, status, hint=None):
+        rows.append("  %-10s %-46s %s" % (label, detail, status))
+        if hint:
+            hint_lines.append("  hint: %s" % hint)
+
+    ctx = None
+    try:
+        cfg = load_config(config_path(args.config))
+        row("config", cfg["_path"], "ok   url %s · collection %s · root %s · timeout %ss"
+            % (cfg["url"], cfg["collection"], cfg.get("root") or "(none)", cfg["timeout"]))
+    except OMError as e:
+        row("config", config_path(args.config), "FAIL %s" % e.message, e.hint)
+        print("\n".join(rows + hint_lines))
+        return e.code
+    try:
+        token, desc = load_token(cfg)
+        row("token", desc, "ok")
+    except OMError as e:
+        row("token", cfg["token_file"], "FAIL %s" % e.message, e.hint)
+        print("\n".join(rows + hint_lines))
+        return e.code
+    transport = Transport(cfg, token)
+    row("transport", transport.proxy_reason, "ok")
+    api = Outline(transport)
+    try:
+        status, _ = transport.health()
+        row("health", "GET /_health", "%d" % status if status == 200 else "FAIL HTTP %d" % status,
+            None if status == 200 else "the URL is reachable but is not a healthy Outline")
+        if status != 200:
+            hard = hard or EXIT_TRANSPORT
+    except OMError as e:
+        row("health", "GET /_health", "FAIL %s" % e.message, e.hint)
+        print("\n".join(rows + hint_lines))
+        transport.close()
+        return e.code
+    try:
+        me = api.auth_info() or {}
+        user = me.get("user") or {}
+        role = user.get("role", "?")
+        row("auth", "auth.info", "ok   user %s · role %s" % (user.get("name", "?"), role),
+            "an admin token can read every collection; use a key of the confined member user" if role == "admin" else None)
+        coll = find_collection(api.collections_list(), cfg["collection"])
+        row("collection", "collections.list", "ok   %s (%s)" % (coll.get("name"), coll["id"][:8]))
+        tree = api.collection_documents(coll["id"])
+        row("tree", "collections.documents", "ok   %d top-level · %d pages total" % (len(tree), count_nodes(tree)))
+        project, source = derive_project(args.cwd or os.getcwd(), cfg.get("projects"), args.project)
+        res = resolve_parent(cfg, tree, project)
+        for line in res["plan"]:
+            label, _, detail = line.partition(": ")
+            row(label, detail, "ok" if "exists" in detail else "will create")
+        row("derived", "%s (%s)" % (project, source), "ok")
+    except OMError as e:
+        row("api", "", "FAIL %s" % e.message, e.hint)
+        hard = hard or e.code
+    finally:
+        transport.close()
+    print("\n".join(rows + hint_lines))
+    return hard
+
+
+def cmd_project(args):
+    cfg = load_config(config_path(args.config))
+    name, source = derive_project(args.cwd or os.getcwd(), cfg.get("projects"), args.project)
+    print("%s\t(%s)" % (name, source))
+    return EXIT_OK
+
+
+def cmd_list(args):
+    ctx = Context(args)
+    try:
+        coll = ctx.collection()
+        tree = ctx.api.collection_documents(coll["id"])
+        project, _ = derive_project(args.cwd or os.getcwd(), ctx.cfg.get("projects"), args.project)
+        res = ctx.resolve_parent(tree, project, args.parent_id)
+        for line in res["plan"]:
+            print(line)
+        if res["siblings"]:
+            print("pages:")
+            for t in res["siblings"]:
+                print("  - %s" % t)
+        else:
+            print("pages: none yet")
+    finally:
+        ctx.close()
+    return EXIT_OK
+
+
+def cmd_create(args):
+    body = read_body(args.body)
+    hits = secret_scan(body)
+    if hits:
+        raise OMError(EXIT_SECRET, "the body looks like it contains secrets: %s" % "; ".join(hits[:6]),
+                      hint="replace them with <redacted> and try again (never bypass this check)")
+    now = _dt.datetime.now().astimezone()
+    today = now.strftime("%Y-%m-%d")
+    title = build_title(args.title, today, args.no_date_prefix)
+    cwd = args.cwd or os.getcwd()
+    tool = args.tool or detect_tool()
+    ctx = Context(args)
+    result = {"ok": True}
+    try:
+        project, source = derive_project(cwd, ctx.cfg.get("projects"), args.project)
+        document = render_document(body, project, tool, args.model, args.scope, args.session, cwd, now)
+        plan = ["project name: %s (%s)" % (project, source), "transport: %s" % ctx.transport.describe()]
+        res = None
+        coll = None
+        try:
+            coll = ctx.collection()
+            tree = ctx.api.collection_documents(coll["id"])
+            res = ctx.resolve_parent(tree, project, args.parent_id)
+            plan += res["plan"]
+            title = unique_title(title, res["siblings"], args.strict_title)
+        except OMError as e:
+            if not args.dry_run:
+                raise
+            plan.append("network: skipped (%s)" % e.message)
+        plan.append("title: %s" % title)
+        if args.dry_run:
+            print("dry-run plan:")
+            for line in plan:
+                print("  " + line)
+            print("---- document ----")
+            sys.stdout.write(document)
+            return EXIT_OK
+        created = {}
+        parent = res["project"]
+        if parent is None:
+            root = res["root"]
+            root_name = res.get("root_name")
+            if root_name and root is None:
+                root = ctx.api.document_create(coll["id"], root_name, "")
+                created["root"] = root
+                if not args.json:
+                    print("root: created %s (%s)" % (root_name, root["id"][:8]))
+            parent = ctx.api.document_create(coll["id"], project, "", root["id"] if root else None)
+            created["project"] = parent
+            if not args.json:
+                print("project: created %s (%s)" % (project, parent["id"][:8]))
+        doc = ctx.api.document_create(coll["id"], title, document, parent["id"])
+        url = ctx.cfg["url"] + (doc.get("url") or "")
+        if args.verify:
+            info = ctx.api.document_info(doc["id"])
+            if (info or {}).get("title") != title:
+                raise OMError(EXIT_API, "verification failed: documents.info returned a different title")
+        result.update({"id": doc["id"], "url": url, "title": title, "project": project,
+                       "parent": {"id": parent["id"], "created": "project" in created},
+                       "root": {"id": (created.get("root") or res["root"] or {}).get("id"), "created": "root" in created},
+                       "transport": ctx.transport.describe()})
+        if args.json:
+            print(json.dumps(result, indent=2, sort_keys=True))
+        else:
+            print('created: "%s" → %s' % (title, url))
+        return EXIT_OK
+    finally:
+        ctx.close()
+
+
+# ── main ──────────────────────────────────────────────────────────────────────
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="outline-memory", description=__doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--config", help="config file (default $OUTLINE_MEMORY_CONFIG or %s)" % DEFAULT_CONFIG)
+    p.add_argument("--json", action="store_true", help="machine-readable result on stdout (create)")
+    sub = p.add_subparsers(dest="command", metavar="command")
+
+    def common(sp):
+        sp.add_argument("--project", help="override the derived project name")
+        sp.add_argument("--cwd", help="directory used to derive the project (default: current)")
+
+    sp = sub.add_parser("check", help="verify config, token, transport, auth and the target tree")
+    common(sp)
+    sp.set_defaults(func=cmd_check)
+    sp = sub.add_parser("project", help="print the project name derived from the working directory")
+    common(sp)
+    sp.set_defaults(func=cmd_project)
+    sp = sub.add_parser("list", help="list the memory pages under root/project")
+    common(sp)
+    sp.add_argument("--parent-id", help="list under this page instead of root/project")
+    sp.set_defaults(func=cmd_list)
+    sp = sub.add_parser("create", help="create a new memory page")
+    common(sp)
+    sp.add_argument("--title", required=True, help="topic; the date is prefixed automatically")
+    sp.add_argument("--body", required=True, help="markdown file, or - for stdin")
+    sp.add_argument("--parent-id", help="create under this page instead of root/project")
+    sp.add_argument("--tool", help='e.g. "Claude Code" or "Codex CLI"')
+    sp.add_argument("--model", help="model id, recorded in Provenance")
+    sp.add_argument("--session", help="session id, recorded in Provenance")
+    sp.add_argument("--scope", help='what the memory covers (default "whole session")')
+    sp.add_argument("--dry-run", action="store_true", help="resolve and render, write nothing")
+    sp.add_argument("--strict-title", action="store_true", help="fail instead of adding a numbered suffix")
+    sp.add_argument("--verify", action="store_true", help="re-read the page after creating it")
+    sp.add_argument("--no-date-prefix", action="store_true", help="use --title verbatim")
+    sp.set_defaults(func=cmd_create)
+    sp = sub.add_parser("version", help="print the version")
+    sp.set_defaults(func=lambda a: print("outline-memory %s" % VERSION) or EXIT_OK)
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return EXIT_USAGE
+    for attr in ("project", "cwd", "parent_id", "json"):
+        if not hasattr(args, attr):
+            setattr(args, attr, None)
+    try:
+        return args.func(args) or EXIT_OK
+    except OMError as e:
+        if getattr(args, "json", False):
+            print(json.dumps({"ok": False, "code": e.code, "error": e.message, "hint": e.hint}))
+        else:
+            sys.stderr.write("error: %s\n" % e.message)
+            if e.hint:
+                sys.stderr.write("hint: %s\n" % e.hint)
+        return e.code
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,31 @@
+# ~/.outline-memory.yml — per-machine settings for the outlinememory skill.
+# Flat `key: value` lines only (plus the optional `projects:` block). Keep it 0600.
+
+# Base URL of your Outline instance, without a trailing slash or /api.
+url: https://outline.example.com
+
+# File holding the Outline API key (ol_api_...), one line, mode 0600.
+token_file: ~/.outline-token
+
+# Collection that receives the memories (resolved by name).
+collection: Memories
+
+# Top-level container page under which one container per project is created.
+# Set to an empty value to put project pages directly at the top level.
+root: dev
+
+# Transport: auto | none | socks5h://host:port | http://host:port
+#   auto  → use socks5h://<proxy_probe> when something listens there, else connect directly
+#   none  → always connect directly (machines that are on the same network/VPN as Outline)
+proxy: auto
+proxy_probe: 127.0.0.1:1055
+
+# Private CA bundle for split-horizon setups where Outline presents a non-public certificate.
+# ca_file: ~/.local/share/ca/internal-root.pem
+
+# Seconds per request.
+timeout: 30
+
+# Optional renames: derived project name → page title used in Outline.
+# projects:
+#   my-repo-name: My Project
