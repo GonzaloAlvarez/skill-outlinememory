@@ -194,7 +194,12 @@ follow-up.
 
 `scripts/no-secrets-check` runs as a pre-commit hook (`git config core.hooksPath .githooks`).
 Put patterns that identify *your* instance (domains, host names, user names) into
-`.no-secrets-local` — it is gitignored on purpose.
+`.no-secrets-local` — it is gitignored on purpose. To scan the whole history before
+publishing (commit headers and the scanner's own regex source excluded):
+
+```sh
+git log -p --format= -- . ':!scripts/no-secrets-check' | scripts/no-secrets-check --stdin
+```
 
 ## License
 
