@@ -106,9 +106,13 @@ outline-memory [--config PATH] [--json] <command>
   project [--cwd DIR]         print the derived project name
   list    [--project P]       titles already under root/project
   create  --title T --body FILE|- [--project P] [--parent-id ID] [--tool T] [--model M]
-          [--session S] [--scope TEXT] [--dry-run] [--strict-title] [--verify] [--no-date-prefix]
+          [--session S] [--scope TEXT] [--dry-run] [--strict-title] [--verify] [--no-date-prefix] [--raw]
   version
 ```
+
+`--raw` publishes the body verbatim (no banner, no provenance table), which together with
+`--no-date-prefix` mirrors a file as a page:
+`outline-memory create --raw --no-date-prefix --project docs --title README.md --body README.md`.
 
 Project derivation: `git remote get-url origin` basename → `git rev-parse --show-toplevel`
 basename → working-directory basename → `projects:` map. `--project` overrides.

@@ -131,8 +131,12 @@ class TestTitlesAndScan(unittest.TestCase):
         hits = cli.secret_scan("x\nkey %s\n" % ("ol_api_" + "b" * 30))
         self.assertEqual(hits, ["line 2: outline api key"])
         self.assertTrue(cli.secret_scan("-----BEGIN " + "OPENSSH PRIVATE KEY-----"))  # split so the repo scanner stays clean
-        self.assertTrue(cli.secret_scan("password = %s" % ("p" * 20)))
-        self.assertTrue(cli.secret_scan("SOME_SERVICE_TOKEN=%s" % ("Q" * 24)))
+        self.assertTrue(cli.secret_scan("password = %s" % ("p4" * 10)))
+        self.assertTrue(cli.secret_scan("SOME_SERVICE_TOKEN=%s" % ("Q7" * 12)))
+        self.assertTrue(cli.secret_scan("secret: %s" % ("dGhpcyBpcyBiYXNlNjQ=")))
+        # a Kubernetes Secret *name* or similar identifier is not a credential
+        self.assertFalse(cli.secret_scan("annotation auth-{type=basic,secret=longhorn-basic-auth} on both Ingresses"))
+        self.assertFalse(cli.secret_scan("token_file: ~/.outline-token-for-this-machine"))
         self.assertFalse(cli.secret_scan("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKonHwC5 comment"))
         self.assertFalse(cli.secret_scan("token_file: ~/.outline-token\nMY_APP_TOKEN=<redacted>\n"
                                          "the token lives only in the server .env as MY_APP_TOKEN"))

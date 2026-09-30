@@ -29,7 +29,7 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 EXIT_OK, EXIT_USAGE, EXIT_CONFIG, EXIT_TRANSPORT, EXIT_AUTH = 0, 2, 3, 4, 5
 EXIT_COLLECTION, EXIT_AMBIGUOUS, EXIT_SECRET, EXIT_API = 6, 7, 8, 9
@@ -58,9 +58,11 @@ SECRET_PATTERNS = [
     ("bearer token", re.compile(r"Bearer [A-Za-z0-9._~+/=-]{24,}")),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{8,}")),
     ("slack token", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}")),
+    # value must contain a digit or a base64 symbol: real keys do, resource names like
+    # `secret=my-basic-auth` (a Kubernetes Secret name) do not.
     ("credential assignment",
      re.compile(r"(?i)[A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|private[_-]?key)"
-                r"\s*[:=]\s*['\"]?[A-Za-z0-9_\-/+=]{16,}")),
+                r"\s*[:=]\s*['\"]?(?=[A-Za-z_\-]*[0-9/+=])[A-Za-z0-9_\-/+=]{16,}")),
 ]
 
 
@@ -645,8 +647,9 @@ def cmd_create(args):
     result = {"ok": True}
     try:
         project, source = derive_project(cwd, ctx.cfg.get("projects"), args.project)
-        document = render_document(body, project, tool, args.model, args.scope, args.session, cwd, now)
-        plan = ["project name: %s (%s)" % (project, source), "transport: %s" % ctx.transport.describe()]
+        document = body if args.raw else render_document(body, project, tool, args.model, args.scope, args.session, cwd, now)
+        plan = ["project name: %s (%s)" % (project, source), "transport: %s" % ctx.transport.describe(),
+                "body: %s" % ("raw (verbatim)" if args.raw else "memory (banner + Provenance)")]
         res = None
         coll = None
         try:
@@ -736,6 +739,8 @@ def build_parser():
     sp.add_argument("--strict-title", action="store_true", help="fail instead of adding a numbered suffix")
     sp.add_argument("--verify", action="store_true", help="re-read the page after creating it")
     sp.add_argument("--no-date-prefix", action="store_true", help="use --title verbatim")
+    sp.add_argument("--raw", action="store_true",
+                    help="publish the body verbatim (no banner, no Provenance table), e.g. to mirror a file")
     sp.set_defaults(func=cmd_create)
     sp = sub.add_parser("version", help="print the version")
     sp.set_defaults(func=lambda a: print("outline-memory %s" % VERSION) or EXIT_OK)

@@ -5,7 +5,7 @@ license: MIT
 allowed-tools: Bash(${CLAUDE_SKILL_DIR}/scripts/outline-memory *)
 metadata:
   short-description: Save this conversation as an Outline memory
-  version: "0.1.0"
+  version: "0.1.1"
   homepage: https://github.com/GonzaloAlvarez/skill-outlinememory
 ---
 

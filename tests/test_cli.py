@@ -152,7 +152,7 @@ class TestCreateEmptyCollection(CliCase):
         self.assertEqual(self.writes(), [])
 
     def test_secret_guard_assignment(self):
-        body = sample_body() + "\nSOME_SERVICE_TOKEN=%s\n" % ("Q" * 24)
+        body = sample_body() + "\nSOME_SERVICE_TOKEN=%s\n" % ("Q7" * 12)
         r = self.create(body=body)
         self.assertEqual(r.returncode, 8, r.stderr)
 
@@ -178,6 +178,15 @@ class TestCreateEmptyCollection(CliCase):
     def test_verify_flag(self):
         r = self.create("--verify")
         self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_raw_mirrors_body_verbatim(self):
+        r = self.create("--raw", "--no-date-prefix", title="NOTES.md", body="# Notes\n\nline one\n\n> quote\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        page = self.writes()[-1]
+        self.assertEqual(page["title"], "NOTES.md")
+        self.assertEqual(page["text"], "# Notes\n\nline one\n\n> quote\n")
+        self.assertNotIn("Provenance", page["text"])
+        self.assertIn("body: raw", self.create("--raw", "--dry-run").stdout)
 
     def test_root_disabled_puts_project_at_top_level(self):
         cfg = make_env(self.tmp.name, self.url, self.fake.token, root="")
