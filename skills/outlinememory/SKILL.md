@@ -1,11 +1,11 @@
 ---
 name: outlinememory
-description: Save a memory of the current conversation to the operator's self-hosted Outline wiki as a new page under the per-project parent page in the Memories collection, with summary, context, decisions, learnings and gotchas, details and open items, secrets redacted. Use when the user says "create memory of this conversation", "save this conversation to outline", "remember this session", or invokes /outlinememory or $outlinememory, optionally with a topic or a scope such as "only the part about X". Requires the local outline-memory config and token described in the skill README; the bundled scripts/outline-memory CLI performs the API calls. Not for reading, searching or editing existing memories.
+description: Save a memory of the current conversation to the operator's self-hosted Outline wiki as a new page under the per-project parent page in the Memories collection, with summary, context, decisions, learnings and gotchas, details and open items, secrets redacted. Use when the user says "create memory of this conversation", "save this conversation to outline", "remember this session", or invokes /outlinememory or $outlinememory, optionally with a topic or a scope such as "only the part about X". Can upload images the user points at and embed them in the page. Requires the local outline-memory config and token described in the skill README; the bundled scripts/outline-memory CLI performs the API calls. Not for reading, searching or editing existing memories.
 license: MIT
 allowed-tools: Bash(${CLAUDE_SKILL_DIR}/scripts/outline-memory *)
 metadata:
   short-description: Save this conversation as an Outline memory
-  version: "0.1.1"
+  version: "0.2.0"
   homepage: https://github.com/GonzaloAlvarez/skill-outlinememory
 ---
 
@@ -54,6 +54,14 @@ Markdown rules for Outline: keep any `>` blockquote on a single line; use `* ` b
 tables are fine; do not write a Provenance section (the CLI appends it); do not start with
 a level-1 heading that repeats the title.
 
+**Images.** Only when the user asked for a screenshot, diagram or other file to be part of
+the memory and it exists on disk: reference it in the body as `![caption](attach:<file name>)`
+and pass `--attach <path>` for that file in Step 4 (repeat both for several files). The CLI
+uploads each file first and swaps the placeholder for the real URL; a file passed without a
+placeholder is listed under an `## Attachments` heading. Attach only files the user pointed at
+or that you produced for them — never configuration files, logs or anything that may contain
+a secret, and never anything you have not looked at.
+
 **Redaction — hard rule.** Never include tokens, API keys, passwords, private keys, cookie
 or session values, `.env` contents or whole configuration files. Replace each with
 `<redacted>`. Describe where a secret lives, never its value. The CLI refuses a body that
@@ -75,7 +83,7 @@ Run one command with the body on stdin (quoted heredoc, so nothing inside is exp
 ```
 ${CLAUDE_SKILL_DIR}/scripts/outline-memory create \
   --title "<topic>" --body - --tool "Claude Code" --model "<your model id>" \
-  [--scope "<thread>"] [--project "<name>"] <<'OUTLINE_MEMORY_BODY'
+  [--scope "<thread>"] [--project "<name>"] [--attach <path>]... <<'OUTLINE_MEMORY_BODY'
 ## Summary
 ...
 OUTLINE_MEMORY_BODY
@@ -92,7 +100,8 @@ under a specific existing page).
 ## Step 5 — report
 
 Quote the CLI's final `created: "<title>" → <url>` line to the user. Mention when the CLI
-reports that it created the `root:` or `project:` container pages.
+reports that it created the `root:` or `project:` container pages, and list any `attached:`
+lines (one per uploaded file).
 
 ## On failure
 

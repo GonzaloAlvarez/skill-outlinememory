@@ -1,8 +1,10 @@
 """An in-memory stand-in for the parts of the Outline API that outline-memory uses.
 
 Scenarios: default · existing_root · existing_parent_with_child · dup_parent ·
-no_collection · unauthorized · html_404 · foreign_tree · admin_user
+no_collection · unauthorized · html_404 · foreign_tree · admin_user · no_upload_scope
 """
+import email.parser
+import email.policy
 import json
 import secrets
 import threading
@@ -23,6 +25,7 @@ class FakeOutline:
         self.scenario = scenario
         self.token = "ol_api_" + secrets.token_hex(19)
         self.writes = []
+        self.attachments = {}
         self.docs = {}
         self.collections = []
         self.tree = {}
@@ -105,6 +108,8 @@ class FakeOutline:
                 if self.headers.get("Authorization") != "Bearer " + fake.token or fake.scenario == "unauthorized":
                     return self._send(401, {"ok": False, "error": "authentication_required", "status": 401,
                                             "message": "Authentication required"})
+                if self.path == "/api/files.create":
+                    return self.m_files_create(raw)
                 try:
                     payload = json.loads(raw.decode() or "{}")
                 except ValueError:
@@ -146,6 +151,59 @@ class FakeOutline:
                 self._send(200, {"ok": True, "data": {"id": node["id"], "url": node["url"], "urlId": node["id"][:10],
                                                       "title": title, "parentDocumentId": pid, "collectionId": cid,
                                                       "text": p.get("text") or ""}})
+
+            def m_attachments_create(self, p):
+                if fake.scenario == "no_upload_scope":
+                    return self._send(403, {"ok": False, "error": "authorization_error", "status": 403,
+                                            "message": "API key does not have access to this resource"})
+                name, size = p.get("name"), p.get("size")
+                if not name or not isinstance(size, int) or size < 0:
+                    return self._send(400, {"ok": False, "error": "validation_error", "message": "name and size are required"})
+                if p.get("documentId") and p["documentId"] not in fake.docs:
+                    return self._send(404, {"ok": False, "error": "not_found", "message": "document not found"})
+                aid = str(uuid.uuid4())
+                key = "uploads/u1/%s/%s" % (aid, name)
+                ctype = p.get("contentType") or "application/octet-stream"
+                fake.attachments[key] = {"id": aid, "name": name, "size": size, "contentType": ctype,
+                                         "documentId": p.get("documentId")}
+                fake.writes.append({"method": "attachments.create", "name": name, "size": size, "contentType": ctype,
+                                    "documentId": p.get("documentId"), "id": aid})
+                self._send(200, {"ok": True, "data": {
+                    "uploadUrl": "/api/files.create",
+                    "form": {"Cache-Control": "max-age=31557600", "Content-Type": ctype, "key": key, "acl": "private",
+                             "maxUploadSize": "26214400", "contentType": ctype, "_csrf": ""},
+                    "attachment": {"id": aid, "url": "/api/attachments.redirect?id=" + aid, "name": name, "size": size,
+                                   "contentType": ctype, "documentId": p.get("documentId"), "userId": "u1"}}})
+
+            def m_files_create(self, raw):
+                ctype = self.headers.get("Content-Type", "")
+                if not ctype.startswith("multipart/form-data"):
+                    return self._send(400, {"ok": False, "error": "validation_error",
+                                            "message": "Request type must be multipart/form-data"})
+                msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
+                    b"Content-Type: " + ctype.encode() + b"\r\nMIME-Version: 1.0\r\n\r\n" + raw)
+                fields, file_part = {}, None
+                for part in msg.iter_parts():
+                    pname = part.get_param("name", header="content-disposition")
+                    filename = part.get_filename()
+                    payload = part.get_payload(decode=True) or b""
+                    if filename is not None:
+                        file_part = (pname, filename, payload, part.get_content_type())
+                    else:
+                        fields[pname] = payload.decode()
+                rec = fake.attachments.get(fields.get("key"))
+                if rec is None:
+                    return self._send(404, {"ok": False, "error": "not_found", "message": "attachment not found"})
+                if file_part is None:
+                    return self._send(400, {"ok": False, "error": "validation_error",
+                                            "message": "Request must include a file parameter"})
+                if len(file_part[2]) > rec["size"]:
+                    return self._send(400, {"ok": False, "error": "validation_error",
+                                            "message": "The uploaded file exceeds the declared size"})
+                fake.writes.append({"method": "files.create", "key": fields["key"], "bytes": len(file_part[2]),
+                                    "filename": file_part[1], "fileField": file_part[0], "fileContentType": file_part[3],
+                                    "fields": sorted(fields)})
+                self._send(200, {"success": True})
 
             def m_documents_info(self, p):
                 did = p.get("id")

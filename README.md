@@ -69,12 +69,13 @@ ideally a dedicated user whose only writable collection is the memories collecti
 scope the key to what the CLI needs:
 
 ```
-auth.info collections.list collections.documents documents.create documents.info
+auth.info collections.list collections.documents documents.create documents.info attachments.create files.create
 ```
 
-A key never exceeds its user's permissions, so a leaked `~/.outline-token` scoped this way
-can only add pages where that user can already write. `check` warns when the key belongs to
-an admin.
+The last two are only needed for `attach` / `create --attach` (Outline stores every scope as
+an `/api/<method>` route scope). A key never exceeds its user's permissions, so a leaked
+`~/.outline-token` scoped this way can only add pages and files where that user can already
+write. `check` warns when the key belongs to an admin.
 
 ### Transport
 
@@ -107,8 +108,31 @@ outline-memory [--config PATH] [--json] <command>
   list    [--project P]       titles already under root/project
   create  --title T --body FILE|- [--project P] [--parent-id ID] [--tool T] [--model M]
           [--session S] [--scope TEXT] [--dry-run] [--strict-title] [--verify] [--no-date-prefix] [--raw]
+          [--attach FILE]...
+  attach  FILE... [--name N] [--document-id ID]   upload files, print the markdown that embeds them
   version
 ```
+
+### Images and other attachments
+
+Outline uploads are two API calls: `attachments.create` registers the file (name, type,
+size) and returns an upload form; `files.create` receives the bytes as `multipart/form-data`
+(on instances backed by S3 the form points at a presigned S3 URL instead, which the CLI
+follows without sending the token). `attach` does both and prints
+`![name](/api/attachments.redirect?id=…)`, ready to paste into a page:
+
+```sh
+outline-memory attach shot.png diagram.svg
+outline-memory create --title "Rollout" --body notes.md --attach shot.png   # notes.md contains ![caption](attach:shot.png)
+```
+
+With `create --attach`, every `![caption](attach:<file name>)` placeholder in the body is
+replaced by the uploaded file's URL; attached files the body never references are listed
+under an `## Attachments` heading. A placeholder without a matching `--attach` is a usage
+error before anything is written; `--dry-run` shows the planned uploads and writes nothing.
+The API key needs the `attachments.create` and `files.create` scopes. Uploads are owned by
+the key's user; Outline keeps an attachment that is not tied to a page (`--document-id`)
+even after the page is deleted — an admin can remove it.
 
 `--raw` publishes the body verbatim (no banner, no provenance table), which together with
 `--no-date-prefix` mirrors a file as a page:
@@ -141,7 +165,7 @@ on stdout, also for errors.
 | Branch | main @ f4459bb |
 | Scope | whole session |
 | Session | - |
-| Written by | outlinememory 0.1.0 |
+| Written by | outlinememory 0.2.0 |
 ```
 
 ## Codex notes
@@ -186,6 +210,8 @@ follow-up.
 | `certificate verify failed` | health | set `ca_file:` to your private CA bundle |
 | `HTTP 401` | auth | key invalid or expired — create a new one |
 | `HTTP 403` on `documents.create` | create | the key lacks the scope, or its user cannot write to the collection |
+| `HTTP 403` on `attachments.create` or the upload | attach | the key lacks `attachments.create` / `files.create` — create a key with both scopes |
+| `attach:name but no matching --attach` (exit 2) | create | pass `--attach <path>` for each placeholder, or remove the reference |
 | `collection … not found` | collection | wrong `collection:` name, or the user cannot see it |
 | `2 top-level pages are titled 'dev'` | root | rename one in Outline or pass `--parent-id` |
 | exit 8 | create | the body contains something that looks like a secret; redact it |

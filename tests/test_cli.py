@@ -1,4 +1,6 @@
+import base64
 import datetime
+import json
 import os
 import re
 import tempfile
@@ -294,3 +296,95 @@ class TestUnauthorized(CliCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+
+
+class AttachCase(CliCase):
+    def png(self, name="pic.png"):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "wb") as fh:
+            fh.write(PNG)
+        return path
+
+
+class TestAttach(AttachCase):
+    def test_attach_uploads_and_prints_markdown(self):
+        r = run_cli(["attach", self.png()], config=self.config)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("attached: pic.png (", r.stdout)
+        self.assertIn("![pic.png](/api/attachments.redirect?id=", r.stdout)
+        w = self.writes()
+        self.assertEqual([x["method"] for x in w], ["attachments.create", "files.create"])
+        self.assertEqual((w[0]["contentType"], w[0]["size"], w[0]["documentId"]), ("image/png", len(PNG), None))
+        self.assertEqual((w[1]["bytes"], w[1]["filename"], w[1]["fileField"], w[1]["fileContentType"]),
+                         (len(PNG), "pic.png", "file", "image/png"))
+        for field in ("Cache-Control", "Content-Type", "_csrf", "acl", "contentType", "key", "maxUploadSize"):
+            self.assertIn(field, w[1]["fields"])
+        self.assertNotIn(self.fake.token, r.stdout + r.stderr)
+
+    def test_attach_json_and_name_and_document_id(self):
+        p = self.png()
+        r = run_cli(["--json", "attach", p, "--name", "renamed.png", "--document-id", "nope"], config=self.config)
+        self.assertEqual(r.returncode, 9, r.stdout)       # unknown document → Outline 404 → API error
+        r = run_cli(["--json", "attach", p, "--name", "renamed.png"], config=self.config)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = json.loads(r.stdout)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["attachments"][0]["name"], "renamed.png")
+        self.assertTrue(out["attachments"][0]["url"].startswith("/api/attachments.redirect?id="))
+        self.assertEqual(out["attachments"][0]["markdown"], "![renamed.png](%s)" % out["attachments"][0]["url"])
+
+    def test_attach_usage_errors_before_network(self):
+        r = run_cli(["attach", os.path.join(self.tmp.name, "missing.png")], config=self.config)
+        self.assertEqual(r.returncode, 2)
+        r = run_cli(["attach", self.png("a.png"), self.png("b.png"), "--name", "x.png"], config=self.config)
+        self.assertEqual(r.returncode, 2)
+        self.assertEqual(self.writes(), [])
+
+    def test_create_with_attach_substitutes_placeholder(self):
+        p = self.png()
+        body = sample_body() + "\n![the shot](attach:pic.png)\n"
+        r = self.create("--attach", p, body=body)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("attached: pic.png", r.stdout)
+        w = self.writes()
+        self.assertEqual([x["method"] for x in w][:2], ["attachments.create", "files.create"])
+        page = w[-1]
+        self.assertEqual(page["method"], "documents.create")
+        self.assertIn("![the shot](/api/attachments.redirect?id=", page["text"])
+        self.assertNotIn("attach:", page["text"])
+        self.assertNotIn("## Attachments", page["text"])
+
+    def test_create_unreferenced_attach_is_listed(self):
+        r = self.create("--attach", self.png("extra.png"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        text = self.writes()[-1]["text"]
+        self.assertIn("## Attachments", text)
+        self.assertIn("![extra.png](/api/attachments.redirect?id=", text)
+        self.assertLess(text.index("## Attachments"), text.index("## Provenance"))
+
+    def test_create_placeholder_without_attach_fails_before_network(self):
+        r = self.create(body=sample_body() + "\n![x](attach:nope.png)\n")
+        self.assertEqual(r.returncode, 2, r.stderr)
+        self.assertIn("attach:nope.png", r.stderr)
+        self.assertEqual(self.writes(), [])
+
+    def test_create_dry_run_uploads_nothing(self):
+        r = self.create("--attach", self.png(), "--dry-run", body=sample_body() + "\n![s](attach:pic.png)\n")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("attach: pic.png (", r.stdout)
+        self.assertIn("](attach:pic.png)", r.stdout)
+        self.assertEqual(self.writes(), [])
+
+
+class TestAttachNoScope(AttachCase):
+    scenario = "no_upload_scope"
+
+    def test_exit_5_with_scope_hint(self):
+        r = run_cli(["attach", self.png()], config=self.config)
+        self.assertEqual(r.returncode, 5, r.stdout + r.stderr)
+        self.assertIn("attachments.create", r.stderr)
+        self.assertIn("scope", r.stderr)
+        self.assertEqual(self.writes(), [])

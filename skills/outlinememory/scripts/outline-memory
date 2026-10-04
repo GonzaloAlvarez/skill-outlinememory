@@ -8,6 +8,10 @@ Layout created in the target collection (all names configurable):
         └── <project>       e.g. my-repo        (empty container page)
             └── YYYY-MM-DD <topic>              (the memory page)
 
+Images and files a page embeds are uploaded first (`attach`, or `create --attach`
+with `![caption](attach:<file name>)` placeholders in the body) through Outline's
+two-step attachments.create → files.create flow.
+
 Transport is `curl` (SOCKS5h proxies and private CAs work everywhere); everything
 else is the Python 3 standard library. Configuration lives in ~/.outline-memory.yml
 and the API token in ~/.outline-token (see README.md). Exit codes:
@@ -28,8 +32,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import mimetypes
+from urllib.parse import urlsplit
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
 
 EXIT_OK, EXIT_USAGE, EXIT_CONFIG, EXIT_TRANSPORT, EXIT_AUTH = 0, 2, 3, 4, 5
 EXIT_COLLECTION, EXIT_AMBIGUOUS, EXIT_SECRET, EXIT_API = 6, 7, 8, 9
@@ -240,18 +246,19 @@ class Transport:
                          % self.token)
         return path
 
-    def _run(self, args, stdin=None):
+    def _run(self, args, stdin=None, timeout=None):
+        timeout = timeout or self.timeout
         body_path = os.path.join(self._tmpdir(), "body")
-        cmd = [self.curl, "-sS", "-o", body_path, "-w", "%{http_code}", "--max-time", str(self.timeout)]
+        cmd = [self.curl, "-sS", "-o", body_path, "-w", "%{http_code}", "--max-time", str(timeout)]
         if self.proxy:
             cmd += ["--proxy", self.proxy]
         if self.ca_file:
             cmd += ["--cacert", self.ca_file]
         cmd += args
         try:
-            proc = subprocess.run(cmd, input=stdin, capture_output=True, timeout=self.timeout + 10)
+            proc = subprocess.run(cmd, input=stdin, capture_output=True, timeout=timeout + 10)
         except subprocess.TimeoutExpired:
-            raise OMError(EXIT_TRANSPORT, "curl timed out after %ss" % self.timeout)
+            raise OMError(EXIT_TRANSPORT, "curl timed out after %ss" % timeout)
         if proc.returncode != 0:
             err = proc.stderr.decode("utf-8", "replace").strip().splitlines()
             msg = err[-1] if err else "curl exit %d" % proc.returncode
@@ -275,6 +282,29 @@ class Transport:
         data = json.dumps(payload).encode("utf-8")
         return self._run(["-X", "POST", "-H", "@" + self._headers_file(), "--data-binary", "@-",
                           "%s/api/%s" % (self.url, method)], stdin=data)
+
+    def _auth_headers_file(self):
+        """Authorization only (no JSON content type) — for multipart uploads."""
+        path = os.path.join(self._tmpdir(), "auth-headers")
+        if not os.path.exists(path):
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write("Authorization: Bearer %s\nAccept: application/json\n" % self.token)
+        return path
+
+    def post_multipart(self, url, fields, file_path, filename, content_type, with_auth=True):
+        """POST multipart/form-data: every `fields` entry verbatim (--form-string) plus the file as `file`."""
+        args = ["-X", "POST"]
+        if with_auth:
+            args += ["-H", "@" + self._auth_headers_file()]
+        for key, value in fields.items():
+            args += ["--form-string", "%s=%s" % (key, value)]
+
+        def q(text):  # curl's quoted form syntax: backslash-escape quotes and backslashes
+            return str(text).replace("\\", "\\\\").replace('"', '\\"')
+
+        args += ["-F", 'file=@"%s";type=%s;filename="%s"' % (q(file_path), content_type, q(filename)), url]
+        return self._run(args, timeout=max(self.timeout, 120))
 
 
 # ── Outline API ───────────────────────────────────────────────────────────────
@@ -320,6 +350,39 @@ class Outline:
 
     def document_info(self, doc_id):
         return self.call("documents.info", {"id": doc_id})
+
+    def attachment_create(self, name, content_type, size, document_id=None):
+        payload = {"name": name, "contentType": content_type, "size": size}
+        if document_id:
+            payload["documentId"] = document_id
+        return self.call("attachments.create", payload)
+
+    def attachment_upload(self, created, file_path, filename, content_type):
+        """Second half of an upload: send the bytes to the uploadUrl attachments.create returned.
+
+        Local file storage returns a relative `/api/files.create` (same origin, bearer needed);
+        S3-backed instances return an absolute presigned URL (no bearer, 204 on success)."""
+        upload_url = (created or {}).get("uploadUrl")
+        if not upload_url or (created or {}).get("mode") == "put":
+            raise OMError(EXIT_API, "attachments.create returned an upload mode this CLI does not support",
+                          hint="only POST uploads (local storage or S3 presigned POST) are supported")
+        origin = urlsplit(self.t.url)
+        if upload_url.startswith("/"):
+            url, with_auth = self.t.url + upload_url, True
+        else:
+            target = urlsplit(upload_url)
+            url, with_auth = upload_url, (target.scheme, target.netloc) == (origin.scheme, origin.netloc)
+        status, body = self.t.post_multipart(url, created.get("form") or {}, file_path, filename, content_type, with_auth)
+        if status in (200, 201, 204):
+            return
+        try:
+            msg = (json.loads(body) if body.strip() else {}).get("message") or ""
+        except ValueError:
+            msg = body.strip()[:120]
+        if status in (401, 403):
+            raise OMError(EXIT_AUTH, "upload of %s: HTTP %d %s" % (filename, status, msg),
+                          hint="the token lacks the `files.create` scope, or the attachment belongs to another user")
+        raise OMError(EXIT_API, "upload of %s: HTTP %d %s" % (filename, status, msg))
 
 
 def find_collection(collections, name):
@@ -538,6 +601,76 @@ def resolve_parent(cfg, tree, project, parent_id=None):
             "plan": plan}
 
 
+# ── attachments ───────────────────────────────────────────────────────────────
+
+ATTACH_REF = re.compile(r"\]\(attach:([^)\s]+)\)")
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return "%d %s" % (n, unit) if unit == "B" else "%.1f %s" % (n, unit)
+        n /= 1024.0
+
+
+def attachment_specs(paths, name=None):
+    """Validate local files before any network call → [{path, name, size, contentType}]."""
+    if name and len(paths) != 1:
+        raise OMError(EXIT_USAGE, "--name applies to exactly one file")
+    specs, seen = [], set()
+    for given in paths:
+        path = os.path.expanduser(given)
+        if not os.path.isfile(path):
+            raise OMError(EXIT_USAGE, "attachment not found: %s" % given)
+        size = os.path.getsize(path)
+        if size == 0:
+            raise OMError(EXIT_USAGE, "attachment is empty: %s" % given)
+        fname = name or os.path.basename(path)
+        if fname in seen:
+            raise OMError(EXIT_USAGE, "two attachments share the name %r; rename one" % fname)
+        seen.add(fname)
+        specs.append({"path": path, "name": fname, "size": size,
+                      "contentType": mimetypes.guess_type(fname)[0] or "application/octet-stream"})
+    return specs
+
+
+def check_attach_refs(body, specs):
+    """Every ](attach:<name>) in the body must name one of the --attach files."""
+    names = {s["name"] for s in specs}
+    missing = sorted({r for r in ATTACH_REF.findall(body) if r not in names and os.path.basename(r) not in names})
+    if missing:
+        raise OMError(EXIT_USAGE, "the body references attach:%s but no matching --attach was given"
+                      % ", attach:".join(missing), hint="pass --attach <path> for each, or remove the reference")
+
+
+def upload_attachments(api, specs, document_id=None):
+    out = []
+    for s in specs:
+        created = api.attachment_create(s["name"], s["contentType"], s["size"], document_id) or {}
+        att = created.get("attachment") or {}
+        if not att.get("url"):
+            raise OMError(EXIT_API, "attachments.create returned no attachment URL for %s" % s["name"])
+        api.attachment_upload(created, s["path"], s["name"], s["contentType"])
+        out.append({"name": s["name"], "path": s["path"], "size": s["size"], "contentType": s["contentType"],
+                    "id": att.get("id"), "url": att["url"], "markdown": "![%s](%s)" % (s["name"], att["url"])})
+    return out
+
+
+def apply_attachments(body, uploaded):
+    """Replace ](attach:<name>) with the upload URL; files nobody referenced go under '## Attachments'."""
+    by_name = {u["name"]: u for u in uploaded}
+    refs = ATTACH_REF.findall(body)
+
+    def lookup(ref):
+        return by_name.get(ref) or by_name.get(os.path.basename(ref))
+
+    body = ATTACH_REF.sub(lambda m: "](%s)" % lookup(m.group(1))["url"] if lookup(m.group(1)) else m.group(0), body)
+    extra = [u for u in uploaded if not any(lookup(r) is u for r in refs)]
+    if extra:
+        body = body.rstrip("\n") + "\n\n## Attachments\n\n" + "\n".join(u["markdown"] for u in extra) + "\n"
+    return body
+
+
 # ── commands ──────────────────────────────────────────────────────────────────
 
 def cmd_check(args):
@@ -638,6 +771,8 @@ def cmd_create(args):
     if hits:
         raise OMError(EXIT_SECRET, "the body looks like it contains secrets: %s" % "; ".join(hits[:6]),
                       hint="replace them with <redacted> and try again (never bypass this check)")
+    specs = attachment_specs(args.attach or [])
+    check_attach_refs(body, specs)
     now = _dt.datetime.now().astimezone()
     today = now.strftime("%Y-%m-%d")
     title = build_title(args.title, today, args.no_date_prefix)
@@ -647,9 +782,13 @@ def cmd_create(args):
     result = {"ok": True}
     try:
         project, source = derive_project(cwd, ctx.cfg.get("projects"), args.project)
-        document = body if args.raw else render_document(body, project, tool, args.model, args.scope, args.session, cwd, now)
+
+        def render(text):
+            return text if args.raw else render_document(text, project, tool, args.model, args.scope, args.session, cwd, now)
+
         plan = ["project name: %s (%s)" % (project, source), "transport: %s" % ctx.transport.describe(),
                 "body: %s" % ("raw (verbatim)" if args.raw else "memory (banner + Provenance)")]
+        plan += ["attach: %s (%s, %s)" % (s["name"], human_size(s["size"]), s["contentType"]) for s in specs]
         res = None
         coll = None
         try:
@@ -668,8 +807,10 @@ def cmd_create(args):
             for line in plan:
                 print("  " + line)
             print("---- document ----")
-            sys.stdout.write(document)
+            sys.stdout.write(render(body))
             return EXIT_OK
+        uploaded = upload_attachments(ctx.api, specs) if specs else []
+        document = render(apply_attachments(body, uploaded) if uploaded else body)
         created = {}
         parent = res["project"]
         if parent is None:
@@ -693,14 +834,33 @@ def cmd_create(args):
         result.update({"id": doc["id"], "url": url, "title": title, "project": project,
                        "parent": {"id": parent["id"], "created": "project" in created},
                        "root": {"id": (created.get("root") or res["root"] or {}).get("id"), "created": "root" in created},
+                       "attachments": uploaded,
                        "transport": ctx.transport.describe()})
         if args.json:
             print(json.dumps(result, indent=2, sort_keys=True))
         else:
+            for u in uploaded:
+                print("attached: %s (%s) → %s" % (u["name"], human_size(u["size"]), u["markdown"]))
             print('created: "%s" → %s' % (title, url))
         return EXIT_OK
     finally:
         ctx.close()
+
+
+def cmd_attach(args):
+    specs = attachment_specs(args.files, args.name)
+    ctx = Context(args)
+    try:
+        uploaded = upload_attachments(ctx.api, specs, args.document_id)
+        transport = ctx.transport.describe()
+    finally:
+        ctx.close()
+    if args.json:
+        print(json.dumps({"ok": True, "attachments": uploaded, "transport": transport}, indent=2, sort_keys=True))
+    else:
+        for u in uploaded:
+            print("attached: %s (%s, %s) → %s" % (u["name"], human_size(u["size"]), u["contentType"], u["markdown"]))
+    return EXIT_OK
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -741,7 +901,16 @@ def build_parser():
     sp.add_argument("--no-date-prefix", action="store_true", help="use --title verbatim")
     sp.add_argument("--raw", action="store_true",
                     help="publish the body verbatim (no banner, no Provenance table), e.g. to mirror a file")
+    sp.add_argument("--attach", action="append", default=[], metavar="FILE",
+                    help="upload FILE first and replace ](attach:<file name>) in the body with its URL; "
+                         "repeatable; files the body never references are listed under '## Attachments'")
     sp.set_defaults(func=cmd_create)
+    sp = sub.add_parser("attach", help="upload images or files and print the markdown that embeds them")
+    common(sp)
+    sp.add_argument("files", nargs="+", metavar="FILE", help="file(s) to upload")
+    sp.add_argument("--name", help="attachment name for a single file (default: its file name)")
+    sp.add_argument("--document-id", help="tie the upload to an existing page (the key needs update rights on it)")
+    sp.set_defaults(func=cmd_attach)
     sp = sub.add_parser("version", help="print the version")
     sp.set_defaults(func=lambda a: print("outline-memory %s" % VERSION) or EXIT_OK)
     return p
@@ -753,7 +922,7 @@ def main(argv=None):
     if not getattr(args, "func", None):
         parser.print_help()
         return EXIT_USAGE
-    for attr in ("project", "cwd", "parent_id", "json"):
+    for attr in ("project", "cwd", "parent_id", "json", "attach", "name", "document_id"):
         if not hasattr(args, attr):
             setattr(args, attr, None)
     try:
